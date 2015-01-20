@@ -1,200 +1,264 @@
 package asynserver
 
 import (
-    "encoding/binary"
-    "fmt"
-    "io"
-    "net"
-    "os"
-    "runtime"
-    "strings"
-    "time"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"sync"
 )
-
-const (
-    keepAliveTime = 10
-    maxPackageLen = 1024 * 10
-)
-
-type Callback struct {
-    //收到包回调
-    IPCMessageCallback func(sess *Session, data []byte) bool
-    //收到包回调
-    MessageCallback func(sess *Session, data []byte) bool
-    //连接关闭回调
-    CloseCallback func(sess *Session)
-    //调用者根据头部信息返回包体长度
-    GetSizeCallback func(header []byte) int
-    //目标地址host example: 192.168.1.1:8888
-    Host string
-}
-
-func init() {
-    runtime.GOMAXPROCS(runtime.NumCPU())
-}
 
 type Session struct {
-    ip       net.IP
-    Conn     net.Conn    //the tcp connection from client
-    RecvChan chan []byte //data from client
-    IPCChan  chan []byte //internet process connection message
-    ErrChan  chan bool
+	conn      net.Conn    //the tcp connection from client
+	recvChan  chan []byte //data from client
+	sendChan  chan []byte //data to client
+	closeChan chan bool
+	exitChan  chan bool
+	exitGroup sync.WaitGroup
+	uniqID    uint64
+	server    *Server
+	data      interface{}
+	lock      sync.Mutex
+	ok        bool
 }
 
-func startSession(client *Session, handler Callback) {
-    defer func() {
-        client.Conn.Close()
-    }()
-    for {
-        select {
-        case msg, ok := <-client.RecvChan:
-            if !ok {
-                // the cmd channel is closed by the other side
-                fmt.Println("The channel is closed by the other side")
-                return
-            }
-            if !handler.MessageCallback(client, msg) {
-                //if process error player need load again
-                fmt.Println("dispatch error ")
-                return
-            }
-        case msg, ok := <-client.IPCChan:
-            if !ok {
-                // the cmd channel is closed by the other side
-                fmt.Println("The channel is closed by the other side")
-                return
-            }
-            if !handler.IPCMessageCallback(client, msg) {
-                //if process error player need load again
-                fmt.Println("ipc dispatch error ")
-            }
-        case <-time.After(20 * time.Second):
-            fmt.Println("Timeout and will close")
-            runtime.Goexit()
-        }
-    }
+func (sess *Session) IsOK() bool {
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
+	return sess.ok
 }
 
-func createSession(conn net.Conn) *Session {
-    var client Session
-    client.ip = net.ParseIP(strings.Split(conn.RemoteAddr().String(), ":")[0])
-    client.RecvChan = make(chan []byte, 1024)
-    client.Conn = conn
-    client.IPCChan = make(chan []byte, 1024)
-    return &client
+func (sess *Session) Close() {
+	sess.conn.Close()
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
+	if sess.ok {
+		sess.ok = false
+		close(sess.closeChan)
+	}
 }
 
-func handleConn(sess *Session, handler Callback) {
-    header := make([]byte, 2)
-    defer func() {
-        handler.CloseCallback(sess)
-        sess.Conn.Close()
-    }()
-    //data := make([]byte, 2048)
-    go startSession(sess, handler)
-    for {
-        n, err := io.ReadFull(sess.Conn, header)
-        if n == 0 && err == io.EOF {
-            //Opposite socket is closed
-            fmt.Println("peer socket is closed")
-            break
-        } else if err != nil {
-            //Sth wrong with this socket
-            fmt.Println(err)
-            break
-        }
-        //size := binary.LittleEndian.Uint16(header) + 4
-        size := handler.GetSizeCallback(header)
-        data := make([]byte, size)
-        n, err = io.ReadFull(sess.Conn, data[0:size])
-        if n == 0 && err == io.EOF {
-            fmt.Println("peer socket is closed")
-            break
-        } else if err != nil {
-            fmt.Println(err)
-            break
-        }
-        sess.RecvChan <- data[0:size] //send data to Client to process
-    }
+func (sess *Session) handleSend() {
+	defer func() {
+		sess.Close()
+		close(sess.sendChan)
+		if x := recover(); x != nil {
+			fmt.Println("send Panic, the panic is", x)
+		}
+	}()
+	for {
+		select {
+		case msg, ok := <-sess.sendChan:
+			if !ok {
+				break
+			}
+			_, err := sess.conn.Write(msg)
+			if err != nil {
+				break
+			}
+		case <-sess.closeChan:
+			break
+		}
+	}
 }
 
-func cliHandleConn(sess *Session) {
-    header := make([]byte, 2)
-    defer sess.Conn.Close()
-    defer func() {
-        sess.ErrChan <- true
-    }()
-    for {
-        n, err := io.ReadFull(sess.Conn, header)
-        if n == 0 && err == io.EOF {
-            //Opposite socket is closed
-            fmt.Println("peer socket is closed")
-            break
-        } else if err != nil {
-            //Sth wrong with this socket
-            fmt.Println(err)
-            break
-        }
-        size := binary.LittleEndian.Uint16(header) + 4
-        //size := handler.GetSizeCallback(header)
-        data := make([]byte, size)
-        n, err = io.ReadFull(sess.Conn, data[0:size])
-        if n == 0 && err == io.EOF {
-            fmt.Println("peer socket is closed")
-            break
-        } else if err != nil {
-            fmt.Println(err)
-            break
-        }
-        sess.RecvChan <- data //send data to Client to process
-    }
+func (sess *Session) handleDispatch() {
+	defer func() {
+		sess.Close()
+		close(sess.recvChan)
+		//for msg := range sess.recvChan {
+		//sess.server.MessageCallback(sess, msg)
+		//}
+		if x := recover(); x != nil {
+			fmt.Println("dispatch Panic, the panic is", x)
+		}
+	}()
+	for {
+		//接受数据 调用回调
+		select {
+		case msg, ok := <-sess.recvChan:
+			if !ok {
+				fmt.Println("The channel is closed by the other side")
+				return
+			}
+			if !sess.server.MessageCallback(sess, msg) {
+				fmt.Println("dispatch error ")
+				return
+			}
+		case <-sess.closeChan:
+		}
+	}
 }
 
-func connectKeepAlive(conn net.Conn, t int) {
-    var interval int
-    if t > 0 {
-        interval = t
-    } else {
-        interval = keepAliveTime
-    }
-    ticker := time.NewTicker(time.Second * time.Duration(interval))
-    data := make([]byte, 6)
-    for t := range ticker.C {
-        _, err := conn.Write(data)
-        if err != nil {
-            fmt.Println(t, err)
-            break
-        }
-    }
+func (sess *Session) RunInQueue(msg []byte) bool {
+	defer func() {
+		if x := recover(); x != nil {
+			fmt.Println("Panic, the panic is", x)
+		}
+	}()
+	if sess.IsOK() {
+		select {
+		case sess.recvChan <- msg:
+			return true
+		case <-sess.closeChan:
+			return false
+		default:
+			return false
+		}
+	}
+	return false
 }
 
-func ConnectToServer(host string, keepalive int) (bool, *Session) {
-    conn, err := net.Dial("tcp", host)
-    if err != nil {
-        fmt.Println("error connect", host, err.Error())
-        return false, nil
-    }
-    sess := createSession(conn)
-    go cliHandleConn(sess)
-    go connectKeepAlive(conn, keepalive)
-    return true, sess
+func (sess *Session) Send(msg []byte) bool {
+	if sess.IsOK() {
+		select {
+		case sess.sendChan <- msg:
+			return true
+		default:
+			return false
+		}
+	}
+	return false
 }
 
-func StartServer(h Callback) {
-    listener, err := net.Listen("tcp", h.Host)
-    if err != nil {
-        fmt.Println("fatal error listening:", err)
-        os.Exit(1)
-    }
-    defer listener.Close()
-    fmt.Println("asynServer start listening:", h.Host)
-    for {
-        conn, err := listener.Accept()
-        if err != nil {
-            fmt.Println("fail accept", err)
-            continue
-        }
-        sess := createSession(conn)
-        go handleConn(sess, h)
-    }
+func (sess *Session) handleRecv() {
+	defer func() {
+		if x := recover(); x != nil {
+			fmt.Println("Panic, the panic is", x)
+		}
+	}()
+	header := make([]byte, 2)
+	for {
+		n, err := io.ReadFull(sess.conn, header)
+		if n == 0 && err == io.EOF {
+			//Opposite socket is closed
+			fmt.Println("peer socket is closed")
+			break
+		} else if err != nil {
+			//Sth wrong with this socket
+			fmt.Println(err)
+			break
+		}
+		size := binary.LittleEndian.Uint16(header)
+		data := make([]byte, size)
+		n, err = io.ReadFull(sess.conn, data[0:size])
+		if n == 0 && err == io.EOF {
+			fmt.Println("peer socket is closed")
+			break
+		} else if err != nil {
+			fmt.Println(err)
+			break
+		}
+		sess.recvChan <- data[0:size] //send data to Client to process
+	}
+}
+
+func (sess *Session) SetData(m interface{}) {
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
+	sess.data = m
+}
+
+func (sess *Session) GetData() (m interface{}) {
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
+	m = sess.data
+	return
+}
+
+func (sess *Session) Start() {
+	defer func() {
+		sess.exitGroup.Done()
+		sess.server.delSession(sess)
+		if x := recover(); x != nil {
+			fmt.Println("start Panic, the panic is", x)
+		}
+	}()
+	go sess.handleRecv()
+	go sess.handleSend()
+	sess.handleDispatch()
+	sess.server.CloseCallback(sess)
+}
+
+func (sess *Session) WaitExit() {
+	sess.exitGroup.Wait()
+}
+
+type CallBacker interface {
+	//收到包回调
+	MessageCallback(sess *Session, data []byte) bool
+	//连接关闭回调
+	CloseCallback(sess *Session, data []byte) bool
+}
+
+type Server struct {
+	bindAddr string
+	listener net.Listener
+	CallBacker
+	sessIndex uint64
+	sessions  map[uint64]*Session
+	chanSize  uint
+}
+
+func NewServer(host string) {
+	var server Server
+	server.bindAddr = host
+	server.CallBacker = handler
+	server.sessions = make(map[uint64]*Session)
+}
+
+func (this *Server) SetCallback(m, c func(sess *Session, data []byte) bool) {
+	this.MessageCallback = m
+	this.CloseCallback = c
+}
+
+func (this *Server) SetChanSize(s uint) {
+	this.chanSize = s
+}
+
+func (this *Server) createSession(conn net.Conn) *Session {
+	var client Session
+	client.exitGroup.Add(1)
+	client.conn = conn
+	size := uint(64)
+	if this.chanSize > 0 {
+		size = this.chanSize
+	}
+	client.recvChan = make(chan []byte, size)
+	client.ok = true
+	client.server = this
+	this.sessIndex++
+	client.uniqID = this.sessIndex
+	this.sessions[this.sessIndex] = &client
+	return &client
+}
+
+func (this *Server) delSession(sess *Session) {
+	delete(this.sessions, this.sessIndex)
+}
+
+func (this *Server) CloseAllSessions() {
+	for _, v := range this.sessions {
+		v.Close()
+	}
+}
+
+func (this *Server) Start() {
+	var err error
+	this.listener, err = net.Listen("tcp", this.bindAddr)
+	if err != nil {
+		fmt.Println("fatal error listening:", err)
+		os.Exit(1)
+	}
+	defer this.listener.Close()
+	for {
+		conn, err := this.listener.Accept()
+		if err != nil {
+			fmt.Println("fail accept", err)
+			continue
+		}
+		sess := this.createSession(conn)
+		go sess.Start()
+	}
 }
