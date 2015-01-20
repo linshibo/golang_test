@@ -82,7 +82,7 @@ func (sess *Session) handleDispatch() {
 				fmt.Println("The channel is closed by the other side")
 				return
 			}
-			if !sess.server.MessageCallback(sess, msg) {
+			if !sess.server.messageCallback(sess, msg) {
 				fmt.Println("dispatch error ")
 				return
 			}
@@ -178,74 +178,89 @@ func (sess *Session) Start() {
 	go sess.handleRecv()
 	go sess.handleSend()
 	sess.handleDispatch()
-	sess.server.CloseCallback(sess)
+	sess.server.closeCallback(sess, nil)
 }
 
 func (sess *Session) WaitExit() {
 	sess.exitGroup.Wait()
 }
 
-type CallBacker interface {
-	//收到包回调
-	MessageCallback(sess *Session, data []byte) bool
-	//连接关闭回调
-	CloseCallback(sess *Session, data []byte) bool
-}
-
 type Server struct {
-	bindAddr string
-	listener net.Listener
-	CallBacker
+	bindAddr  string
+	listener  net.Listener
 	sessIndex uint64
 	sessions  map[uint64]*Session
 	chanSize  uint
+	lock      sync.Mutex
+	//收到包回调
+	messageCallback func(sess *Session, data []byte) bool
+	//连接关闭回调
+	closeCallback func(sess *Session, data []byte) bool
 }
 
 func NewServer(host string) {
 	var server Server
 	server.bindAddr = host
-	server.CallBacker = handler
 	server.sessions = make(map[uint64]*Session)
 }
 
 func (this *Server) SetCallback(m, c func(sess *Session, data []byte) bool) {
-	this.MessageCallback = m
-	this.CloseCallback = c
+	this.lock.Lock()
+	defer this.lock.Unlock()
+	this.messageCallback = m
+	this.closeCallback = c
 }
 
 func (this *Server) SetChanSize(s uint) {
+	this.lock.Lock()
+	defer this.lock.Unlock()
 	this.chanSize = s
+}
+
+func (this *Server) getChanSize() uint {
+	this.lock.Lock()
+	defer this.lock.Unlock()
+	return this.chanSize
 }
 
 func (this *Server) createSession(conn net.Conn) *Session {
 	var client Session
 	client.exitGroup.Add(1)
 	client.conn = conn
-	size := uint(64)
-	if this.chanSize > 0 {
-		size = this.chanSize
+	size := this.getChanSize()
+	if size == 0 {
+		size = 64
 	}
 	client.recvChan = make(chan []byte, size)
 	client.ok = true
 	client.server = this
 	this.sessIndex++
 	client.uniqID = this.sessIndex
+	this.lock.Lock()
+	defer this.lock.Unlock()
 	this.sessions[this.sessIndex] = &client
 	return &client
 }
 
 func (this *Server) delSession(sess *Session) {
+	this.lock.Lock()
+	defer this.lock.Unlock()
 	delete(this.sessions, this.sessIndex)
 }
 
 func (this *Server) CloseAllSessions() {
+	this.lock.Lock()
+	defer this.lock.Unlock()
 	for _, v := range this.sessions {
 		v.Close()
 	}
 }
 
-func (this *Server) Start() {
+func (this *Server) Start() error {
 	var err error
+	if this.messageCallback == nil || this.closeCallback == nil {
+		return err
+	}
 	this.listener, err = net.Listen("tcp", this.bindAddr)
 	if err != nil {
 		fmt.Println("fatal error listening:", err)
@@ -261,4 +276,5 @@ func (this *Server) Start() {
 		sess := this.createSession(conn)
 		go sess.Start()
 	}
+	return nil
 }
